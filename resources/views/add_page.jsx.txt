@@ -1,0 +1,617 @@
+import {useState, useCallback, useEffect } from 'react';
+import {
+  Box,
+  Card,
+  Badge,
+  Page,
+  Text,
+  BlockStack,
+  InlineGrid,
+  TextField,
+  Divider,
+  RadioButton,
+  InlineStack,
+  Button,
+  ResourceList, ResourceItem,
+  Avatar,
+  Select,
+  ButtonGroup,
+  ChoiceList,
+  DataTable
+} from "@shopify/polaris";
+import { useLoaderData, useFetcher } from "@remix-run/react";
+import { authenticate } from "../shopify.server";
+import { useAppBridge } from '@shopify/app-bridge-react';
+import db from "../db.server";
+import { pageCreateMutation } from "../graphQl_queries/page/mutations";
+import { metafieldDefinitionCreateMutation, setMetafieldDataMutation } from "../graphQl_queries/metafield/mutations";
+import { discountCreateMutation } from '../graphQl_queries/discount/mutations';
+
+
+// Loader function to fetch initial data
+// This function is called when the page is loaded
+export const loader = async ({ request } ) => {
+  const { session } = await authenticate.admin(request);
+  const { shop } = session;
+  const collections = [];
+
+  return {
+    shop: shop,
+    pageVisibility: 'draft',
+    precollections: collections
+  };
+};
+
+// Function to handle discount code creation
+async function handleDiscountsAction(discountData,request) {
+    const { admin } = await authenticate.admin(request);
+    const results = [];
+    for (const discount of discountData) {
+      const variables = {
+        basicCodeDiscount: discount.basicCodeDiscount
+      };
+      try {
+        const response = await discountCreateMutation(admin, variables);
+        if (response.data?.discountCodeBasicCreate?.userErrors?.length) {
+          results.push({
+            title: discount.basicCodeDiscount.title,
+            error: response.data.discountCodeBasicCreate.userErrors,
+          });
+        } else {
+          results.push({
+            title: discount.basicCodeDiscount.title,
+            id: response.data.discountCodeBasicCreate.codeDiscountNode.id,
+          });
+        }
+      } catch (err) {
+        // Handle error
+        console.log("Error creating discount code:", err);
+        results.push({
+          title: discount.basicCodeDiscount.title,
+          error: "Something went wrong with the discount code creation process.",
+        });
+      }
+    };
+
+    return results;
+}
+
+// Action function to handle form submission.
+// This function is called when the form is submitted.
+export const action = async ({ request }) => {
+  const { admin, session } = await authenticate.admin(request);
+  const formData = await request.formData();
+  const title = formData.get("title");
+  const status = formData.get("status");
+  const collections = JSON.parse(formData.get("collections"));
+  const discounts = JSON.parse(formData.get("discounts"));
+
+  // Ensure metafield definition exists for list of collections.
+  try {
+    const metafieldResponse = await metafieldDefinitionCreateMutation(admin, {
+      "definition": {
+        "name": "Mimac Page Collections",
+        "namespace": "custom",
+        "description": "Please do not make any changes to this Metafield definition. It is created and used to store collection_references from the API list.",
+        "key": "mimac_collections",
+        "type": "list.collection_reference",
+        "ownerType": "PAGE"
+      }
+    });
+  } catch (e) {
+    // Ignore if already exists
+    // console.log("metafieldDefinitionError=====",e);
+  }
+
+  // Create page in Shopify
+  const pageResponse = await pageCreateMutation(admin, {
+    "page": {
+      "title": title,
+      "handle": title.toLowerCase().replace(/ /g, "-"),
+      "isPublished": (status === "active") ? true : false,
+      "templateSuffix": "mimac"
+    }
+  });
+
+  if(pageResponse.data?.pageCreate?.page) {
+    const page = pageResponse.data.pageCreate.page;
+    const collectionsData = collections.map((collection) => collection.id);
+    const dbPageData = await db.page.create({
+      data: {
+        pageId: page.id,
+        status: (status === "active") ? "active" : "draft",
+        shop: session.shop,
+      }
+    });
+
+    // Update metafield for the page with selected collections
+    if (collectionsData.length > 0) {
+      const updateMetafieldResponse = await setMetafieldDataMutation(admin, {
+        "metafields": [
+          {
+            "ownerId": page.id,
+            "namespace": "custom",
+            "key": "mimac_collections",
+            "type": "list.collection_reference",
+            "value": JSON.stringify(collectionsData)
+          }
+        ]
+      });
+    }
+    // Create discounts in Shopify
+    if(discounts.length > 0) {
+      await handleDiscountsAction(discounts,request).then((discountResponse) => {
+        discountResponse.map(async (discount) => {
+          if(discount.id) {
+            await db.discounts.create({
+              data: {
+                discountId: discount.id,
+                title: discount.title,
+                code: discount.title,
+                pageId: dbPageData.id,
+                shop: session.shop
+              }
+            });
+          }
+        });
+      });
+    }
+  }
+
+  return {
+    data: pageResponse.data.pageCreate,
+    status: 200,
+    message: "Page created successfully",
+  }
+};
+
+export default function MixMatchPage() {
+  const { shop, pageVisibility, precollections } = useLoaderData();
+  const shopify = useAppBridge();
+  const fetcher = useFetcher();
+
+  const [selectedItems, setSelectedItems] = useState([]);
+  const [formData, setFormData] = useState({
+    shop: shop,
+    title: "",
+    status: "draft",
+    collections: precollections,
+    discounts: []
+  });
+  const [discountData, setDiscountData] = useState({
+    discountMethod: "discount-code",
+    discountTitle: "",
+    discountValueType: "percentage",
+    discountValue: "",
+    minimumRequirementType: "subtotal",
+    minimumRequirementValue: ""
+  });
+
+  useEffect(() => {
+    if(fetcher?.data?.data?.userErrors && fetcher?.data?.data?.userErrors.length > 0) {
+      fetcher.data.data.userErrors.map((error) => {
+        shopify.toast.show(`${error.message}`, { isError: true });
+      });
+    }else if(fetcher?.data?.status == 200) {
+      shopify.toast.show(`${fetcher.data.message}`);
+    } else {
+      shopify.toast.hide();
+    }
+  }, [fetcher?.data]);
+
+  const handleDiscounts = useCallback((value, field) => {
+    setDiscountData((prevState) => {
+      return { ...prevState, [field]: value };
+    });
+  }, []);
+
+  const handleChangeField = useCallback((value, field) => {
+    setFormData((prevState) => {
+      let updatedState = { ...prevState, [field]: value };
+      return updatedState;
+    });
+  }, []);
+
+  const handleSubmit = async () => {
+    if(formData.title === "") {
+      shopify.toast.show("Page title requried.", { isError: true });
+      return;
+    }
+    if(formData.collections.length === 0) {
+      shopify.toast.show("Select at least one collection.", { isError: true });
+      return;
+    }
+    const data = new FormData();
+    data.append("title", formData.title);
+    data.append("status", formData.status);
+    data.append("collections", JSON.stringify(formData.collections));
+    data.append("discounts", JSON.stringify(formData.discounts));
+    fetcher.submit(data, { method: "POST" });
+  };
+
+  const openCollectionModal = async () => {
+    const selectedCollections = await shopify.resourcePicker({type: 'collection', multiple: true, selectionIds: formData.collections.map((collection) => ({id: collection.id})) });
+    if (selectedCollections) {
+      const selected = selectedCollections.map((collection) => {
+        return({
+          id: collection.id,
+          title: collection.title,
+          handle: collection.handle,
+          productsCount: collection.productsCount,
+          image: collection.image
+        })
+      });
+      setFormData((prevState) => ({...prevState, collections: selected}));
+    } else {
+      console.log('Picker was cancelled by the user');
+    }
+  }
+
+  const deleteCollection = () => {
+    const filteredCollections = formData.collections.filter(collection => !selectedItems.includes(collection.id));
+    setFormData((prevState) => ({...prevState, collections: filteredCollections}));
+    setSelectedItems([]);
+  }
+
+  const saveDiscount = () => {
+    if(discountData.discountTitle === "") {
+      shopify.toast.show("Discount code required.", { isError: true });
+      return;
+    }
+
+    if(discountData.discountValue === "") {
+      shopify.toast.show("Discount value required.", { isError: true });
+      return;
+    }
+    if(discountData.minimumRequirementValue === "") {
+      shopify.toast.show("Discount minimum requirement value required.", { isError: true });
+      return;
+    }
+    const discountSchema = {
+      [(discountData.discountMethod === "automatic-discount") ? "automaticBasicDiscount" : "basicCodeDiscount"]: {
+        "title": discountData.discountTitle.trim(),
+        "code": discountData.discountTitle.trim(),
+        "startsAt": new Date().toISOString(),
+        "minimumRequirement": {
+          [(discountData.minimumRequirementType === "subtotal") ? "subtotal" : "quantity"]: {
+            ...(discountData.minimumRequirementType === "subtotal"
+              ? { greaterThanOrEqualToSubtotal: parseFloat(discountData.minimumRequirementValue) }
+              : { greaterThanOrEqualToQuantity: discountData.minimumRequirementValue })
+          }
+        },
+        "customerGets": {
+          "value": {
+              ...(discountData.discountValueType === "percentage"
+                ? { percentage: parseFloat(discountData.discountValue)/100 }
+                : { discountAmount: {amount: parseFloat(discountData.discountValue), appliesOnEachItem: true }})
+          },
+          "items": {
+            "collections": {"add": formData.collections.map((collection) => collection.id)}
+          }
+        },
+        "customerSelection": { "all": true },
+        "combinesWith": {
+          "productDiscounts": true,
+          "shippingDiscounts": true,
+          "orderDiscounts": true
+        }
+      }
+    }
+    setFormData((prevState) => ({...prevState, discounts: [...prevState.discounts, discountSchema]}));
+    setDiscountData({
+      discountMethod: "discount-code",
+      discountTitle: "",
+      discountValueType: "percentage",
+      discountValue: "",
+      minimumRequirementType: "subtotal",
+      minimumRequirementValue: ""
+    });
+  }
+  const deleteDiscountRow = (discount) => {
+    const filteredDiscounts = formData.discounts.filter((item) => {
+      const discountType = Object.keys(discount)[0];
+      const discountData = discount[discountType];
+      return item[discountType].code !== discountData.code;
+    });
+    setFormData((prevState) => ({...prevState, discounts: filteredDiscounts}));
+    setDiscountData({
+      discountMethod: "discount-code",
+      discountTitle: "",
+      discountValueType: "percentage",
+      discountValue: "",
+      minimumRequirementType: "subtotal",
+      minimumRequirementValue: ""
+    });
+  }
+
+  const [activeButtonIndex, setActiveButtonIndex] = useState(0);
+  const handleButtonClick = useCallback(
+    (index) => {
+      if (activeButtonIndex === index) return;
+      setActiveButtonIndex(index);
+      setDiscountData((prevState) => ({...prevState, discountMethod: tabs[index].id}));
+    },
+    [activeButtonIndex],
+  );
+  const tabs = [
+    {
+      id: 'discount-code',
+      label: 'Discount Code',
+      name: 'code',
+      content: 'Discount code',
+      notice: 'Customers must enter this code at checkout.',
+    },
+    // {
+    //   id: 'automatic-discount',
+    //   label: 'Title',
+    //   name: 'title',
+    //   content: 'Automatic discount',
+    //   notice: 'Customers will see this in their cart and at checkout.',
+    // },
+  ];
+
+  return (
+    <Page
+      fullWidth
+      title="New Mix&Match"
+      titleMetadata={(pageVisibility === 'active') ? <Badge tone="success">Active</Badge> : <Badge tone="info">Draft</Badge>}
+      primaryAction={{
+        content: 'Save',
+        onAction: handleSubmit
+      }}
+      secondaryActions={[
+        {
+          content: 'Cancel',
+          url: '/app'
+        },
+      ]}
+    >
+      <BlockStack gap={{ xs: "800", sm: "400" }}>
+        <InlineGrid columns={{ xs: "1fr", md: "2fr 5fr" }} gap="400">
+          <Box
+            as="section"
+            paddingInlineStart={{ xs: 400, sm: 0 }}
+            paddingInlineEnd={{ xs: 400, sm: 0 }}
+          >
+            <BlockStack gap="400">
+              <Text as="h3" variant="headingMd">
+                Page
+              </Text>
+              <Text as="p" variant="bodyMd">
+                Add page information to create new page as Mix&Match.
+              </Text>
+            </BlockStack>
+          </Box>
+          <Card roundedAbove="sm">
+            <BlockStack gap="400">
+              <TextField label="Title" name="title" value={formData.title} placeholder="e.g. mix&match, Sale, Offer" onChange={(value) => handleChangeField(value, 'title')} />
+              <TextField label="Handle" placeholder={formData.title.toLowerCase().replace(/ /g, "-")} disabled={true} />
+              <InlineGrid>
+                <RadioButton label="Active" name="status" checked={formData.status === 'active'} id="active" onChange={() => handleChangeField('active', 'status')} />
+                <RadioButton label="Draft" name="status" checked={formData.status === 'draft'} id="draft" onChange={() => handleChangeField('draft', 'status')} />
+              </InlineGrid>
+            </BlockStack>
+          </Card>
+        </InlineGrid>
+
+        <Divider />
+
+        <InlineGrid columns={{ xs: "1fr", md: "2fr 5fr" }} gap="400">
+          <Box
+            as="section"
+            paddingInlineStart={{ xs: 400, sm: 0 }}
+            paddingInlineEnd={{ xs: 400, sm: 0 }}
+          >
+            <BlockStack gap="400">
+              <Text as="h3" variant="headingMd">
+                Collections
+              </Text>
+              <Text as="p" variant="bodyMd">
+                Add collections to setup filters for mix&match page.
+              </Text>
+            </BlockStack>
+          </Box>
+          <Card roundedAbove="sm">
+            <BlockStack gap="400">
+              {formData.collections.length === 0 && (
+                <Text variant="bodyMd" tone="subdued">No collections selected</Text>
+              )}
+              <ResourceList
+                resourceName={{ singular: "collection", plural: "collections" }}
+                items={formData.collections}
+                selectedItems={selectedItems}
+                onSelectionChange={setSelectedItems}
+                promotedBulkActions={[
+                  {
+                    content: 'Delete',
+                    destructive: true,
+                    onAction: () => deleteCollection(),
+                  },
+                ]}
+                renderItem={(collection) => {
+                  const {id, title} = collection;
+                  const media = (collection.image)? <Avatar source={collection.image.originalSrc} size="md" name={title} /> : <Avatar size="md" name={title} />;
+
+                  return (
+                    <ResourceItem
+                      id={id}
+                      media={media}
+                    >
+                      <Text variant="bodyMd" fontWeight="bold" as="h3">{title}</Text>
+                    </ResourceItem>
+                  )
+                }}
+              />
+              <InlineStack align="end">
+                <Button
+                  variant="primary"
+                  onClick={() => openCollectionModal()}
+                >
+                  Select Collections
+                </Button>
+              </InlineStack>
+            </BlockStack>
+          </Card>
+        </InlineGrid>
+
+        <Divider />
+
+        <InlineGrid columns={{ xs: "1fr", md: "2fr 5fr" }} gap="400">
+          <Box
+            as="section"
+            paddingInlineStart={{ xs: 400, sm: 0 }}
+            paddingInlineEnd={{ xs: 400, sm: 0 }}
+          >
+            <BlockStack gap="400">
+              <Text as="h3" variant="headingMd">
+                Discount {"(optional)"}
+              </Text>
+              <Text as="p" variant="bodyMd">
+                Add discount on your Mix&Match.
+              </Text>
+            </BlockStack>
+          </Box>
+          <BlockStack gap="400">
+            <Card roundedAbove="sm">
+              <BlockStack gap="400">
+                <Text as="h4" variant="regular">Method</Text>
+                <ButtonGroup variant="segmented">
+                  <Button
+                    pressed={activeButtonIndex === 0}
+                    onClick={() => handleButtonClick(0)}
+                  >
+                    Discount Code
+                  </Button>
+                  {/* <Button
+                    pressed={activeButtonIndex === 1}
+                    onClick={() => handleButtonClick(1)}
+                  >
+                    Automatic discount
+                  </Button> */}
+                </ButtonGroup>
+                <TextField
+                  label={tabs[activeButtonIndex].label}
+                  name={tabs[activeButtonIndex].name}
+                  value={discountData.discountTitle}
+                  onChange={(value) => handleDiscounts(value, 'discountTitle')}
+                  helpText={tabs[activeButtonIndex].notice}
+                />
+                <Divider />
+                <Text as="h4" variant="medium">Discount Value</Text>
+                <InlineStack gap="400">
+                  <Select
+                    labelHidden
+                    label="Discount Value"
+                    options={['percentage', 'discountAmount']}
+                    value={discountData.discountValueType}
+                    onChange={(value) => handleDiscounts(value, 'discountValueType')}
+                  />
+                  <TextField
+                    type="number"
+                    name="discountValue"
+                    value={discountData.discountValue}
+                    onChange={(value) => handleDiscounts(value, 'discountValue')}
+                    placeholder='0'
+                    min={0}
+                    max={(discountData.discountValueType == "percentage") ? '100' : '1000'}
+                  />
+                </InlineStack>
+                <Divider />
+                <Text as="h4" variant="medium">Minimum purchase requirements</Text>
+                <ChoiceList
+                  choices={[
+                    {
+                      label: 'Minimum purchase amount',
+                      value: 'subtotal',
+                      renderChildren: ((isSelected) => isSelected && (
+                        <TextField
+                          onChange={(value) => handleDiscounts(value, 'minimumRequirementValue')}
+                          helpText="Applies only to selected collections."
+                          value={discountData.minimumRequirementValue}
+                          autoComplete="off"
+                          type="number"
+                        />
+                      ))
+                    },
+                    {
+                      label: 'Minimum quantity of items',
+                      value: 'quantity',
+                      renderChildren: ((isSelected) => isSelected && (
+                        <TextField
+                          onChange={(value) => handleDiscounts(value, 'minimumRequirementValue')}
+                          helpText="Applies only to selected collections."
+                          value={discountData.minimumRequirementValue}
+                          autoComplete="off"
+                          type="number"
+                        />
+                      ))
+                    },
+                  ]}
+                  selected={discountData.minimumRequirementType}
+                  onChange={(value) => handleDiscounts(value, 'minimumRequirementType')}
+                />
+                <InlineStack align="end">
+                  <Button
+                    variant="primary"
+                    onClick={() => saveDiscount()}
+                  >
+                    Save Discount
+                  </Button>
+                </InlineStack>
+              </BlockStack>
+            </Card>
+            <Card roundedAbove="sm">
+              <BlockStack gap="400">
+                <DataTable
+                  showTotalsInFooter
+                  columnContentTypes={[
+                    'text',
+                    // 'text',
+                    'text',
+                    'text',
+                    'text'
+                  ]}
+                  headings={[
+                    'Title',
+                    // 'Type',
+                    'Discount',
+                    'Requirement',
+                    ''
+                  ]}
+                  rows={
+                    formData.discounts.map((discount) => {
+                      const discountType = Object.keys(discount)[0]; // Get dynamic object name (automaticBasicDiscount or basicCodeDiscount)
+                      const discountData = discount[discountType]; // Access discount data
+
+                      // Determine Discount Value (Percentage or Amount)
+                      const discountValueKey = Object.keys(discountData.customerGets.value)[0]; // Get dynamic key
+                      const discountValue = discountValueKey === "percentage"
+                        ? `${discountData.customerGets.value.percentage}% off`
+                        : `$${discountData.customerGets.value.amount} off`;
+
+                      // Determine Minimum Requirement
+                      const minimumRequirement =
+                        discountData.minimumRequirement.subtotal?.greaterThanOrEqualToSubtotal !== undefined
+                          ? `$${discountData.minimumRequirement.subtotal.greaterThanOrEqualToSubtotal} min amount`
+                          : `${discountData.minimumRequirement.quantity.greaterThanOrEqualToQuantity} min quantity`;
+
+                      return [
+                        discountData.title,    // Discount Title
+                        // discountType,          // Discount Type
+                        discountValue,         // Discount Value
+                        minimumRequirement,     // Minimum Requirement
+                        <Button destructive onClick={() => deleteDiscountRow(discount)}>Delete</Button> // Delete Button
+                      ];
+                    })
+                  }
+                />
+              </BlockStack>
+            </Card>
+          </BlockStack>
+        </InlineGrid>
+
+        <Divider />
+      </BlockStack>
+    </Page>
+  );
+}
